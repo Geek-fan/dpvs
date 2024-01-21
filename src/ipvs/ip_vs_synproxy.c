@@ -39,6 +39,7 @@
 #define DP_VS_SYNPROXY_SACK_DEFAULT             1
 #define DP_VS_SYNPROXY_WSCALE_DEFAULT           0
 #define DP_VS_SYNPROXY_TIMESTAMP_DEFAULT        0
+#define DP_VS_SYNPROXY_CLWND_DEFAULT            0
 #define DP_VS_SYNPROXY_DEFER_DEFAULT            0
 #define DP_VS_SYNPROXY_DUP_ACK_DEFAULT          10
 #define DP_VS_SYNPROXY_MAX_ACK_SAVED_DEFAULT    3
@@ -54,6 +55,7 @@ int dp_vs_synproxy_ctrl_sack = DP_VS_SYNPROXY_SACK_DEFAULT;
 int dp_vs_synproxy_ctrl_wscale = DP_VS_SYNPROXY_WSCALE_DEFAULT;
 int dp_vs_synproxy_ctrl_timestamp = DP_VS_SYNPROXY_TIMESTAMP_DEFAULT;
 int dp_vs_synproxy_ctrl_synack_ttl = DP_VS_SYNPROXY_TTL_DEFAULT;
+int dp_vs_synproxy_ctrl_clwnd = DP_VS_SYNPROXY_CLWND_DEFAULT;
 int dp_vs_synproxy_ctrl_defer = DP_VS_SYNPROXY_DEFER_DEFAULT;
 int dp_vs_synproxy_ctrl_conn_reuse = DP_VS_SYNPROXY_CONN_REUSE_DEFAULT;
 int dp_vs_synproxy_ctrl_conn_reuse_cl = DP_VS_SYNPROXY_CONN_REUSE_CL_DEFAULT;
@@ -412,12 +414,11 @@ syn_proxy_v4_cookie_check(struct rte_mbuf *mbuf, uint32_t cookie,
             th->source, th->dest, seq, rte_atomic32_read(&g_minute_count),
             DP_VS_SYNPROXY_COUNTER_TRIES);
 
+    memset(opt, 0, sizeof(struct dp_vs_synproxy_opt));
     if ((uint32_t) -1 == res) /* count is invalid, g_minute_count' >> g_minute_count */
         return 0;
 
     mssind = (res & DP_VS_SYNPROXY_MSS_MASK) >> DP_VS_SYNPROXY_MSS_BITS;
-
-    memset(opt, 0, sizeof(struct dp_vs_synproxy_opt));
     if ((mssind < NUM_MSS) && ((res & DP_VS_SYNPROXY_OTHER_MASK) == 0)) {
         opt->mss_clamp = msstab[mssind] + 1;
         opt->sack_ok = (res & DP_VS_SYNPROXY_SACKOK_MASK) >> DP_VS_SYNPROXY_SACKOK_BIT;
@@ -449,12 +450,11 @@ syn_proxy_v6_cookie_check(struct rte_mbuf *mbuf, uint32_t cookie,
                    th->source, th->dest, seq, rte_atomic32_read(&g_minute_count),
                    DP_VS_SYNPROXY_COUNTER_TRIES);
 
+    memset(opt, 0, sizeof(struct dp_vs_synproxy_opt));
     if ((uint32_t) -1 == res) /* count is invalid, g_minute_count' >> g_minute_count */
         return 0;
 
     mssind = (res & DP_VS_SYNPROXY_MSS_MASK) >> DP_VS_SYNPROXY_MSS_BITS;
-
-    memset(opt, 0, sizeof(struct dp_vs_synproxy_opt));
     if ((mssind < NUM_MSS) && ((res & DP_VS_SYNPROXY_OTHER_MASK) == 0)) {
         opt->mss_clamp = msstab[mssind] + 1;
         opt->sack_ok = (res & DP_VS_SYNPROXY_SACKOK_MASK) >> DP_VS_SYNPROXY_SACKOK_BIT;
@@ -476,6 +476,40 @@ syn_proxy_v6_cookie_check(struct rte_mbuf *mbuf, uint32_t cookie,
 /*
  *  Synproxy implementation
  */
+
+static unsigned char syn_proxy_parse_wscale_opt(struct rte_mbuf *mbuf, struct tcphdr *th)
+{
+    int length;
+    unsigned char opcode, opsize;
+    unsigned char *ptr;
+
+    length = (th->doff * 4) - sizeof(struct tcphdr);
+    ptr = (unsigned char *)(th + 1);
+    while (length > 0) {
+        opcode = *ptr++;
+        switch (opcode) {
+            case TCPOPT_EOL:
+                return 0;
+            case TCPOPT_NOP:
+                length--;
+                continue;
+            default:
+                opsize = *ptr++;
+                if (opsize < 2) /* silly options */
+                    return 0;
+                if (opsize > length) /* partial options */
+                    return 0;
+                if (opcode == TCPOPT_WINDOW) {
+                    if (*ptr > DP_VS_SYNPROXY_WSCALE_MAX) /* invalid wscale opt */
+                        return 0;
+                    return *ptr;
+                }
+                ptr += opsize -2;
+                length -= opsize;
+        }
+    }
+    return 0; /* should never reach here */
+}
 
 /* Replace tcp options in tcp header, called by syn_proxy_reuse_mbuf() */
 static void syn_proxy_parse_set_opts(struct rte_mbuf *mbuf, struct tcphdr *th,
@@ -610,8 +644,9 @@ static void syn_proxy_reuse_mbuf(int af, struct rte_mbuf *mbuf,
     tmpport = th->dest;
     th->dest = th->source;
     th->source = tmpport;
-    /* set window size to zero */
-    th->window = 0;
+    /* set window size to zero if enabled */
+    if (dp_vs_synproxy_ctrl_clwnd && !dp_vs_synproxy_ctrl_defer)
+        th->window = 0;
     /* set seq(cookie) and ack_seq */
     th->ack_seq = htonl(ntohl(th->seq) + 1);
     th->seq = htonl(isn);
@@ -691,8 +726,7 @@ int dp_vs_synproxy_syn_rcv(int af, struct rte_mbuf *mbuf,
 
     if (th->syn && !th->ack && !th->rst && !th->fin &&
             (svc = dp_vs_service_lookup(af, iph->proto, &iph->daddr, th->dest, 0,
-                                        NULL, NULL, NULL, rte_lcore_id())) &&
-            (svc->flags & DPVS_CONN_F_SYNPROXY)) {
+                NULL, NULL, rte_lcore_id())) && (svc->flags & DP_VS_SVC_F_SYNPROXY)) {
         /* if service's weight is zero (non-active realserver),
          * do noting and drop the packet */
         if (svc->weight == 0) {
@@ -773,8 +807,8 @@ syn_rcv_out:
 static inline int syn_proxy_ack_has_data(struct rte_mbuf *mbuf,
         const struct dp_vs_iphdr *iph, struct tcphdr *th)
 {
-    RTE_LOG(DEBUG, IPVS, "tot_len = %u, iph_len = %u, tcph_len = %u\n",
-            mbuf->pkt_len, iph->len, th->doff * 4);
+    RTE_LOG(DEBUG, IPVS, "%s: tot_len = %u, iph_len = %u, tcph_len = %u\n",
+            __func__, mbuf->pkt_len, iph->len, th->doff * 4);
     return (mbuf->pkt_len - iph->len - th->doff * 4) != 0;
 }
 
@@ -1143,7 +1177,7 @@ int dp_vs_synproxy_ack_rcv(int af, struct rte_mbuf *mbuf,
     /* Do not check svc syn-proxy flag, as it may be changed after syn-proxy step 1. */
     if (!th->syn && th->ack && !th->rst && !th->fin &&
             (svc = dp_vs_service_lookup(af, iph->proto, &iph->daddr,
-                           th->dest, 0, NULL, NULL, NULL, rte_lcore_id()))) {
+                           th->dest, 0, NULL, NULL, rte_lcore_id()))) {
         if (dp_vs_synproxy_ctrl_defer &&
                 !syn_proxy_ack_has_data(mbuf, iph, th)) {
             /* Update statistics */
@@ -1179,7 +1213,7 @@ int dp_vs_synproxy_ack_rcv(int af, struct rte_mbuf *mbuf,
 
         /* Let the virtual server select a real server for the incoming connetion,
          * and create a connection entry */
-        *cpp = dp_vs_schedule(svc, iph, mbuf, 1, 0);
+        *cpp = dp_vs_schedule(svc, iph, mbuf, 1);
         if (unlikely(!*cpp)) {
             RTE_LOG(WARNING, IPVS, "%s: ip_vs_schedule failed\n", __func__);
             /* FIXME: What to do when virtual service is available but no destination
@@ -1187,6 +1221,9 @@ int dp_vs_synproxy_ack_rcv(int af, struct rte_mbuf *mbuf,
             *verdict = INET_DROP;
             return 0;
         }
+
+        if (opt.wscale_ok)
+            (*cpp)->wscale_vs = dp_vs_synproxy_ctrl_wscale;
 
         /* Do nothing but print a error msg when fail, because session will be
          * correctly freed in dp_vs_conn_expire */
@@ -1406,6 +1443,7 @@ int dp_vs_synproxy_synack_rcv(struct rte_mbuf *mbuf, struct dp_vs_conn *cp,
     if ((th->syn) && (th->ack) && (!th->rst) &&
             (cp->flags & DPVS_CONN_F_SYNPROXY) &&
             (cp->state == DPVS_TCP_S_SYN_SENT)) {
+        cp->wscale_rs = syn_proxy_parse_wscale_opt(mbuf, th);
         cp->syn_proxy_seq.delta = ntohl(cp->syn_proxy_seq.isn) - ntohl(th->seq);
         cp->state = DPVS_TCP_S_ESTABLISHED;
         dp_vs_conn_set_timeout(cp, pp);
@@ -1414,6 +1452,7 @@ int dp_vs_synproxy_synack_rcv(struct rte_mbuf *mbuf, struct dp_vs_conn *cp,
             rte_atomic32_inc(&dest->actconns);
             rte_atomic32_dec(&dest->inactconns);
             cp->flags &= ~DPVS_CONN_F_INACTIVE;
+            dp_vs_dest_detected_alive(dest);
         }
 
         /* Save tcp sequence for fullnat/nat, inside to outside */
@@ -1455,7 +1494,7 @@ int dp_vs_synproxy_synack_rcv(struct rte_mbuf *mbuf, struct dp_vs_conn *cp,
          * The probe will be forward to RS and RS will respond a window update.
          * So DPVS has no need to send a window update.
          */
-        if (cp->ack_num == 1)
+        if (dp_vs_synproxy_ctrl_clwnd && !dp_vs_synproxy_ctrl_defer && cp->ack_num <= 1)
             syn_proxy_send_window_update(tuplehash_out(cp).af, mbuf, cp, pp, th);
 
         list_for_each_entry_safe(tmbuf, tmbuf2, &cp->ack_mbuf, list) {
@@ -1481,6 +1520,7 @@ int dp_vs_synproxy_synack_rcv(struct rte_mbuf *mbuf, struct dp_vs_conn *cp,
             (cp->state == DPVS_TCP_S_SYN_SENT)) {
         RTE_LOG(DEBUG, IPVS, "%s: get rst from rs, seq = %u ack_seq = %u\n",
                 __func__, ntohl(th->seq), ntohl(th->ack_seq));
+        dp_vs_dest_detected_dead(dest);
 
         /* Count the delta of seq */
         cp->syn_proxy_seq.delta = ntohl(cp->syn_proxy_seq.isn) - ntohl(th->seq);
@@ -1788,14 +1828,33 @@ static void synack_sack_handler(vector_t tokens)
 
 static void synack_wscale_handler(vector_t tokens)
 {
-    RTE_LOG(INFO, IPVS, "synproxy_synack_options_wscale ON\n");
-    dp_vs_synproxy_ctrl_wscale = 1;
+    char *str = set_value(tokens);
+    int wscale;
+
+    assert(str);
+    wscale = atoi(str);
+    if (wscale >= 0 && wscale <= DP_VS_SYNPROXY_WSCALE_MAX) {
+        RTE_LOG(INFO, IPVS, "synproxy_synack_options_wscale = %d\n", wscale);
+        dp_vs_synproxy_ctrl_wscale = wscale;
+    } else {
+        RTE_LOG(WARNING, IPVS, "invalid synproxy_synack_options_wscale %s, using default %d\n",
+                str, DP_VS_SYNPROXY_WSCALE_DEFAULT);
+        dp_vs_synproxy_ctrl_init_mss = DP_VS_SYNPROXY_WSCALE_DEFAULT;
+    }
+
+    FREE_PTR(str);
 }
 
 static void synack_timestamp_handler(vector_t tokens)
 {
     RTE_LOG(INFO, IPVS, "synproxy_synack_options_timestamp ON\n");
     dp_vs_synproxy_ctrl_timestamp = 1;
+}
+
+static void close_client_window_handler(vector_t tokens)
+{
+    RTE_LOG(INFO, IPVS, "close_client_window ON\n");
+    dp_vs_synproxy_ctrl_clwnd = 1;
 }
 
 static void defer_rs_syn_handler(vector_t tokens)
@@ -1903,17 +1962,18 @@ void synproxy_keyword_value_init(void)
     }
     /* KW_TYPE_NORMAL keyword */
     dp_vs_synproxy_ctrl_init_mss = DP_VS_SYNPROXY_INIT_MSS_DEFAULT;
-    dp_vs_synproxy_ctrl_sack = 0;
-    dp_vs_synproxy_ctrl_wscale = 0;
-    dp_vs_synproxy_ctrl_timestamp = 0;
+    dp_vs_synproxy_ctrl_sack = DP_VS_SYNPROXY_SACK_DEFAULT;
+    dp_vs_synproxy_ctrl_wscale = DP_VS_SYNPROXY_WSCALE_DEFAULT;
+    dp_vs_synproxy_ctrl_timestamp = DP_VS_SYNPROXY_TIMESTAMP_DEFAULT;
     dp_vs_synproxy_ctrl_synack_ttl = DP_VS_SYNPROXY_TTL_DEFAULT;
-    dp_vs_synproxy_ctrl_defer = 0;
-    dp_vs_synproxy_ctrl_conn_reuse = 0;
-    dp_vs_synproxy_ctrl_conn_reuse_cl = 0;
-    dp_vs_synproxy_ctrl_conn_reuse_tw = 0;
-    dp_vs_synproxy_ctrl_conn_reuse_fw = 0;
-    dp_vs_synproxy_ctrl_conn_reuse_cw = 0;
-    dp_vs_synproxy_ctrl_conn_reuse_la = 0;
+    dp_vs_synproxy_ctrl_clwnd = DP_VS_SYNPROXY_CLWND_DEFAULT;
+    dp_vs_synproxy_ctrl_defer = DP_VS_SYNPROXY_DEFER_DEFAULT;
+    dp_vs_synproxy_ctrl_conn_reuse = DP_VS_SYNPROXY_CONN_REUSE_DEFAULT;
+    dp_vs_synproxy_ctrl_conn_reuse_cl = DP_VS_SYNPROXY_CONN_REUSE_CL_DEFAULT;
+    dp_vs_synproxy_ctrl_conn_reuse_tw = DP_VS_SYNPROXY_CONN_REUSE_TW_DEFAULT;
+    dp_vs_synproxy_ctrl_conn_reuse_fw = DP_VS_SYNPROXY_CONN_REUSE_FW_DEFAULT;
+    dp_vs_synproxy_ctrl_conn_reuse_cw = DP_VS_SYNPROXY_CONN_REUSE_CW_DEFAULT;
+    dp_vs_synproxy_ctrl_conn_reuse_la = DP_VS_SYNPROXY_CONN_REUSE_LA_DEFAULT;
     dp_vs_synproxy_ctrl_dup_ack_thresh = DP_VS_SYNPROXY_DUP_ACK_DEFAULT;
     dp_vs_synproxy_ctrl_max_ack_saved = DP_VS_SYNPROXY_MAX_ACK_SAVED_DEFAULT;
     dp_vs_synproxy_ctrl_syn_retry = DP_VS_SYNPROXY_SYN_RETRY_DEFAULT;
@@ -1934,6 +1994,7 @@ void install_synproxy_keywords(void)
     install_keyword("timestamp", synack_timestamp_handler, KW_TYPE_NORMAL);
     install_sublevel_end();
 
+    install_keyword("close_client_window", close_client_window_handler, KW_TYPE_NORMAL);
     install_keyword("defer_rs_syn", defer_rs_syn_handler, KW_TYPE_NORMAL);
     install_keyword("rs_syn_max_retry", rs_syn_max_retry_handler, KW_TYPE_NORMAL);
     install_keyword("ack_storm_thresh", ack_storm_thresh_handler, KW_TYPE_NORMAL);

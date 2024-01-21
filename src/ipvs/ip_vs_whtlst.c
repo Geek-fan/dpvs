@@ -213,12 +213,13 @@ static int dp_vs_whtlst_del(int af, uint8_t proto, const union inet_addr *vaddr,
     }
 
     /*del whtlst ip on all slave lcores*/
-    msg = msg_make(MSG_TYPE_WHTLST_DEL, 0, DPVS_MSG_MULTICAST,
+    msg = msg_make(MSG_TYPE_WHTLST_DEL, whtlst_msg_seq(), DPVS_MSG_MULTICAST,
                    cid, sizeof(struct dp_vs_whtlst_conf), &cf);
     if (!msg)
         return EDPVS_NOMEM;
     err = multicast_msg_send(msg, DPVS_MSG_F_ASYNC, NULL);
     if (err != EDPVS_OK) {
+        msg_destroy(&msg);
         RTE_LOG(INFO, SERVICE, "[%s] fail to send multicast message\n", __func__);
         return err;
     }

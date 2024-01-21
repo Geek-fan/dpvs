@@ -15,7 +15,8 @@ global_defs {
     log_level   WARNING
     ! log_file    /var/log/dpvs.log
     ! log_async_mode    off
-    ! pdump       off
+    ! kni               on
+    ! pdump             off
 }
 
 ! netif config
@@ -36,6 +37,7 @@ netif_defs {
         }
         ! mtu                   1500
         ! promisc_mode
+        ! allmulticast
         ! kni_name              dpdk0.kni
     }
 
@@ -51,6 +53,7 @@ netif_defs {
         }
         ! mtu                   1500
         ! promisc_mode
+        ! allmulticast
         ! kni_name                dpdk1.kni
     }
 
@@ -67,6 +70,7 @@ netif_defs {
         }
         ! mtu                   1500
         ! promisc_mode
+        ! allmulticast
         ! kni_name              dpdk2.kni
     }
 
@@ -82,6 +86,7 @@ netif_defs {
         }
         ! mtu                   1500
         ! promisc_mode
+        ! allmulticast
         ! kni_name              dpdk3.kni
     } 
 
@@ -248,17 +253,18 @@ worker_defs {
         }
     }
 
-    !<init> worker cpu9 {
+    !<init> worker cpu17 {
     !    type    kni
-    !    cpu_id  9
+    !    cpu_id  17
     !    port    bond0 {
+    !        rx_queue_ids     8
     !        tx_queue_ids     8
     !    }
     !    port    bond1 {
+    !        rx_queue_ids     8
     !        tx_queue_ids     8
     !    }
     !}
-
 }
 
 ! timer config
@@ -271,6 +277,11 @@ timer_defs {
 neigh_defs {
     <init> unres_queue_length  128
     <init> timeout             60
+}
+
+! dpvs ipset config
+ipset_defs {
+    <init> ipset_hash_pool_size 131072
 }
 
 ! dpvs ipv4 config
@@ -302,9 +313,6 @@ ctrl_defs {
         sync_msg_timeout_us             20000
         priority_level                  low
     }
-    ipc_msg {
-        <init> unix_domain /var/run/dpvs_ctrl
-    }
 }
 
 ! ipvs config
@@ -323,6 +331,7 @@ ipvs_defs {
         uoa_mode        opp
         uoa_max_trail   3
         timeout {
+            oneway      60
             normal      300
             last        3
         }
@@ -349,7 +358,7 @@ ipvs_defs {
                 mss             1452
                 ttl             63
                 sack
-                ! wscale
+                ! wscale        0
                 ! timestamp
             }
             ! defer_rs_syn

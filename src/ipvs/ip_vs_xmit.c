@@ -70,6 +70,7 @@ static int __dp_vs_fast_xmit_fnat4(struct dp_vs_proto *proto,
         err = proto->fnat_in_handler(proto, conn, mbuf);
         if(err != EDPVS_OK)
             return err;
+        ip4h = ip4_hdr(mbuf);
     }
 
     if (likely(mbuf->ol_flags & PKT_TX_IP_CKSUM)) {
@@ -476,6 +477,7 @@ static int __dp_vs_xmit_fnat4(struct dp_vs_proto *proto,
         err = proto->fnat_in_handler(proto, conn, mbuf);
         if (err != EDPVS_OK)
             goto errout;
+        iph = ip4_hdr(mbuf);
     }
 
     if (likely(mbuf->ol_flags & PKT_TX_IP_CKSUM)) {
@@ -674,6 +676,7 @@ static int __dp_vs_xmit_fnat64(struct dp_vs_proto *proto,
         err = proto->fnat_in_handler(proto, conn, mbuf);
         if (err != EDPVS_OK)
             goto errout;
+        ip4h = ip4_hdr(mbuf);
     }
 
     if (likely(mbuf->ol_flags & PKT_TX_IP_CKSUM)) {
@@ -858,7 +861,7 @@ static int __dp_vs_out_xmit_fnat6(struct dp_vs_proto *proto,
     mtu = rt6->rt6_mtu;
     if (mbuf->pkt_len > mtu) {
         RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
-        icmp6_send(mbuf, ICMP6_PACKET_TOO_BIG, 0, htonl(mtu));
+        icmp6_send(mbuf, ICMP6_PACKET_TOO_BIG, 0, mtu);
         err = EDPVS_FRAG;
         goto errout;
     }
@@ -1304,7 +1307,7 @@ static int __dp_vs_xmit_dr6(struct dp_vs_proto *proto,
     mtu = rt6->rt6_mtu;
     if (mbuf->pkt_len > mtu) {
         RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
-        icmp6_send(mbuf, ICMP6_PACKET_TOO_BIG, 0, htonl(mtu));
+        icmp6_send(mbuf, ICMP6_PACKET_TOO_BIG, 0, mtu);
         err = EDPVS_FRAG;
         goto errout;
     }
@@ -1456,7 +1459,7 @@ static int __dp_vs_xmit_snat6(struct dp_vs_proto *proto,
     mtu = rt6->rt6_mtu;
     if (mbuf->pkt_len > mtu) {
         RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
-        icmp6_send(mbuf, ICMP6_PACKET_TOO_BIG, 0, htonl(mtu));
+        icmp6_send(mbuf, ICMP6_PACKET_TOO_BIG, 0, mtu);
         err = EDPVS_FRAG;
         goto errout;
     }
@@ -1520,20 +1523,11 @@ static int __dp_vs_out_xmit_snat4(struct dp_vs_proto *proto,
         fl4.fl4_daddr = conn->caddr.in;
         fl4.fl4_saddr = conn->vaddr.in;
         fl4.fl4_tos = iph->type_of_service;
-        
 
-        if (conn->outwall) {
-	    rt = route_gfw_net_lookup(&conn->caddr.in);
-            if (!rt) {
-                err = EDPVS_NOROUTE;
-                goto errout;
-            }
-        } else {
-            rt = route4_output(&fl4);
-            if (!rt) {
-                err = EDPVS_NOROUTE;
-                goto errout;
-            }
+        rt = route4_output(&fl4);
+        if (!rt) {
+            err = EDPVS_NOROUTE;
+            goto errout;
         }
         MBUF_USERDATA(mbuf, struct route_entry *, MBUF_FIELD_ROUTE) = rt;
 
@@ -1703,7 +1697,7 @@ static int __dp_vs_out_xmit_snat6(struct dp_vs_proto *proto,
 
     if (mbuf->pkt_len > rt6->rt6_mtu) {
         RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
-        icmp6_send(mbuf, ICMP6_PACKET_TOO_BIG, 0, htonl(rt6->rt6_mtu));
+        icmp6_send(mbuf, ICMP6_PACKET_TOO_BIG, 0, rt6->rt6_mtu);
         err = EDPVS_FRAG;
         goto errout;
     }
@@ -1872,7 +1866,7 @@ static int __dp_vs_xmit_nat6(struct dp_vs_proto *proto,
     mtu = rt6->rt6_mtu;
     if (mbuf->pkt_len > mtu) {
         RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
-        icmp6_send(mbuf, ICMP6_PACKET_TOO_BIG, 0, htonl(mtu));
+        icmp6_send(mbuf, ICMP6_PACKET_TOO_BIG, 0, mtu);
         err = EDPVS_FRAG;
         goto errout;
     }
@@ -2044,7 +2038,7 @@ static int __dp_vs_out_xmit_nat6(struct dp_vs_proto *proto,
     mtu = rt6->rt6_mtu;
     if (mbuf->pkt_len > mtu) {
         RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
-        icmp6_send(mbuf, ICMP6_PACKET_TOO_BIG, 0, htonl(mtu));
+        icmp6_send(mbuf, ICMP6_PACKET_TOO_BIG, 0, mtu);
         err = EDPVS_FRAG;
         goto errout;
     }
@@ -2108,6 +2102,7 @@ static int __dp_vs_xmit_tunnel4(struct dp_vs_proto *proto,
     uint8_t tos = old_iph->type_of_service;
     uint16_t df = old_iph->fragment_offset & htons(RTE_IPV4_HDR_DF_FLAG);
     int err, mtu;
+    uint32_t ip4h_len = sizeof(struct rte_ipv4_hdr);
 
     /*
      * drop old route. just for safe, because
@@ -2133,7 +2128,15 @@ static int __dp_vs_xmit_tunnel4(struct dp_vs_proto *proto,
     mtu = rt->mtu;
     MBUF_USERDATA(mbuf, struct route_entry *, MBUF_FIELD_ROUTE) = rt;
 
-    new_iph = (struct rte_ipv4_hdr*)rte_pktmbuf_prepend(mbuf, sizeof(struct rte_ipv4_hdr));
+    if (mbuf->pkt_len + ip4h_len > mtu && df) {
+        RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
+        icmp_send(mbuf, ICMP_DEST_UNREACH, ICMP_UNREACH_NEEDFRAG,
+                  htonl(mtu - ip4h_len));
+        err = EDPVS_FRAG;
+        goto errout;
+    }
+
+    new_iph = (struct rte_ipv4_hdr*)rte_pktmbuf_prepend(mbuf, ip4h_len);
     if (!new_iph) {
         RTE_LOG(WARNING, IPVS, "%s: mbuf has not enough headroom"
                 " space for ipvs tunnel\n", __func__);
@@ -2141,15 +2144,7 @@ static int __dp_vs_xmit_tunnel4(struct dp_vs_proto *proto,
         goto errout;
     }
 
-    if (mbuf->pkt_len > mtu && df) {
-        RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
-        icmp_send(mbuf, ICMP_DEST_UNREACH, ICMP_UNREACH_NEEDFRAG,
-                  htonl(rt->mtu));
-        err = EDPVS_FRAG;
-        goto errout;
-    }
-
-    memset(new_iph, 0, sizeof(struct rte_ipv4_hdr));
+    memset(new_iph, 0, ip4h_len);
     new_iph->version_ihl = 0x45;
     new_iph->type_of_service = tos;
     new_iph->total_length = htons(mbuf->pkt_len);
@@ -2189,6 +2184,7 @@ static int __dp_vs_xmit_tunnel6(struct dp_vs_proto *proto,
     struct ip6_hdr *new_ip6h, *old_ip6h = ip6_hdr(mbuf);
     struct route6 *rt6;
     int err, mtu;
+    uint32_t ip6h_len = sizeof(struct ip6_hdr);
 
     /*
      * drop old route. just for safe, because
@@ -2213,7 +2209,14 @@ static int __dp_vs_xmit_tunnel6(struct dp_vs_proto *proto,
     mtu = rt6->rt6_mtu;
     MBUF_USERDATA(mbuf, struct route6 *, MBUF_FIELD_ROUTE) = rt6;
 
-    new_ip6h = (struct ip6_hdr*)rte_pktmbuf_prepend(mbuf, sizeof(struct ip6_hdr));
+    if (mbuf->pkt_len + ip6h_len > mtu) {
+        RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
+        icmp6_send(mbuf, ICMP6_PACKET_TOO_BIG, 0, mtu - ip6h_len);
+        err = EDPVS_FRAG;
+        goto errout;
+    }
+
+    new_ip6h = (struct ip6_hdr*)rte_pktmbuf_prepend(mbuf, ip6h_len);
     if (!new_ip6h) {
         RTE_LOG(WARNING, IPVS, "%s: mbuf has not enough headroom"
                 " space for ipvs tunnel\n", __func__);
@@ -2221,20 +2224,13 @@ static int __dp_vs_xmit_tunnel6(struct dp_vs_proto *proto,
         goto errout;
     }
 
-    if (mbuf->pkt_len > mtu) {
-        RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
-        icmp6_send(mbuf, ICMP6_PACKET_TOO_BIG, 0, htonl(mtu));
-        err = EDPVS_FRAG;
-        goto errout;
-    }
-
-    memset(new_ip6h, 0, sizeof(struct ip6_hdr));
+    memset(new_ip6h, 0, ip6h_len);
     new_ip6h->ip6_flow = old_ip6h->ip6_flow;
-    new_ip6h->ip6_plen = htons(mbuf->pkt_len - sizeof(struct ip6_hdr));
+    new_ip6h->ip6_plen = htons(mbuf->pkt_len - ip6h_len);
     new_ip6h->ip6_nxt = IPPROTO_IPV6;
     new_ip6h->ip6_hops = old_ip6h->ip6_hops;
 
-    new_ip6h->ip6_src = rt6->rt6_src.addr;
+    new_ip6h->ip6_src = rt6->rt6_src.addr.in6;
     if (unlikely(ipv6_addr_any(&new_ip6h->ip6_src))) {
         RTE_LOG(INFO, IPVS, "%s: route6 without source, slect source"
                 " address from inetaddr.\n", __func__);
@@ -2264,6 +2260,7 @@ static int __dp_vs_xmit_tunnel_6o4(struct dp_vs_proto *proto,
     struct route_entry *rt;
     struct rte_ipv4_hdr *new_iph;
     struct ip6_hdr *old_ip6h = ip6_hdr(mbuf);
+    uint32_t ip4h_len = sizeof(struct rte_ipv4_hdr);
 
     /*
      * drop old route. just for safe, because
@@ -2289,7 +2286,14 @@ static int __dp_vs_xmit_tunnel_6o4(struct dp_vs_proto *proto,
     mtu = rt->mtu;
     MBUF_USERDATA(mbuf, struct route_entry *, MBUF_FIELD_ROUTE) = rt;
 
-    new_iph = (struct rte_ipv4_hdr*)rte_pktmbuf_prepend(mbuf, sizeof(struct rte_ipv4_hdr));
+    if (mbuf->pkt_len + ip4h_len > mtu) {
+        RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
+        icmp6_send(mbuf, ICMP6_PACKET_TOO_BIG, 0, mtu - ip4h_len);
+        err = EDPVS_FRAG;
+        goto errout;
+    }
+
+    new_iph = (struct rte_ipv4_hdr*)rte_pktmbuf_prepend(mbuf, ip4h_len);
     if (!new_iph) {
         RTE_LOG(WARNING, IPVS, "%s: mbuf has not enough headroom"
                 " space for ipvs tunnel\n", __func__);
@@ -2297,14 +2301,7 @@ static int __dp_vs_xmit_tunnel_6o4(struct dp_vs_proto *proto,
         goto errout;
     }
 
-    if (mbuf->pkt_len > mtu) {
-        RTE_LOG(DEBUG, IPVS, "%s: frag needed.\n", __func__);
-        icmp6_send(mbuf, ICMP6_PACKET_TOO_BIG, 0, htonl(mtu));
-        err = EDPVS_FRAG;
-        goto errout;
-    }
-
-    memset(new_iph, 0, sizeof(struct rte_ipv4_hdr));
+    memset(new_iph, 0, ip4h_len);
     new_iph->version_ihl = 0x45;
     new_iph->type_of_service = 0;
     new_iph->total_length = htons(mbuf->pkt_len);
